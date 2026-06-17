@@ -1,0 +1,8 @@
+[project]
+name = "docker-layer-analyzer"
+version = "1.0.0"
+description = "Docker image layer analysis tool"
+requires-python = ">=3.8"
+
+[project.scripts]
+docker-layer-analyzer = "docker_layer_analyzer.cli:main"
