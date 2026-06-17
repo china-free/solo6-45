@@ -336,6 +336,79 @@ class TestSlimmingReport(unittest.TestCase):
         waste = calculate_duplicate_waste(dups)
         report = generate_slimming_report(self.image, dups, waste)
         self.assertGreater(len(report.merge_suggestions), 0)
+        for s in report.merge_suggestions:
+            self.assertGreater(len(s.involved_files), 0)
+
+    def test_no_double_counting(self):
+        dups = find_duplicate_files(self.image)
+        waste = calculate_duplicate_waste(dups)
+        report = generate_slimming_report(self.image, dups, waste)
+
+        cache = report.total_cache_size
+        dup = report.duplicate_waste
+        merge = sum(s.potential_saving for s in report.merge_suggestions)
+        total = report.total_potential_saving
+
+        self.assertEqual(total, cache + dup + merge)
+
+        raw_cache = sum(c.size for c in report.cache_findings)
+        self.assertGreaterEqual(raw_cache, cache)
+
+        raw_merge_total = 0
+        for s in report.merge_suggestions:
+            raw_merge_total += sum(f[2] for f in s.involved_files)
+        self.assertGreaterEqual(raw_merge_total, merge)
+
+    def test_deduplication_accuracy(self):
+        dups = find_duplicate_files(self.image)
+        waste = calculate_duplicate_waste(dups)
+        report = generate_slimming_report(self.image, dups, waste)
+
+        cache_files = {(c.layer_index, c.path): c.size for c in report.cache_findings}
+
+        counted = set()
+        expected_cache = 0
+        for (li, path), size in cache_files.items():
+            if (li, path) not in counted:
+                counted.add((li, path))
+                expected_cache += size
+
+        self.assertEqual(report.total_cache_size, expected_cache)
+
+        expected_dup = 0
+        for path, occurrences in dups.items():
+            for i in range(1, len(occurrences)):
+                layer_idx, size, _ = occurrences[i]
+                if (layer_idx, path) not in counted:
+                    counted.add((layer_idx, path))
+                    expected_dup += size
+
+        self.assertEqual(report.duplicate_waste, expected_dup)
+
+        expected_merge = 0
+        for s in report.merge_suggestions:
+            for layer_idx, file_path, file_size in s.involved_files:
+                if (layer_idx, file_path) not in counted:
+                    counted.add((layer_idx, file_path))
+                    expected_merge += file_size
+
+        total_merge = sum(s.potential_saving for s in report.merge_suggestions)
+        self.assertEqual(total_merge, expected_merge)
+
+        self.assertEqual(report.total_potential_saving, expected_cache + expected_dup + expected_merge)
+
+    def test_merge_suggestion_involved_files_structure(self):
+        dups = find_duplicate_files(self.image)
+        waste = calculate_duplicate_waste(dups)
+        report = generate_slimming_report(self.image, dups, waste)
+
+        for s in report.merge_suggestions:
+            self.assertIsInstance(s.involved_files, list)
+            for item in s.involved_files:
+                self.assertEqual(len(item), 3)
+                self.assertIsInstance(item[0], int)
+                self.assertIsInstance(item[1], str)
+                self.assertIsInstance(item[2], int)
 
 
 if __name__ == "__main__":

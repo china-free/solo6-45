@@ -1,7 +1,7 @@
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .parser import ImageInfo, LayerInfo, _parse_whiteout_name
 
@@ -69,6 +69,7 @@ class MergeSuggestion:
     layer_indices: List[int]
     reason: str
     potential_saving: int
+    involved_files: List[Tuple[int, str, int]] = field(default_factory=list)
 
 
 @dataclass
@@ -152,15 +153,18 @@ def find_mergeable_layers(image: ImageInfo) -> List[MergeSuggestion]:
 
                     if not intermediate_delete:
                         saving = 0
+                        involved = []
                         for k in range(i + 1, j + 1):
                             for f in image.layers[k].files:
                                 if _parse_whiteout_name(f.path) is None:
                                     saving += f.size
+                                    involved.append((k, f.path, f.size))
 
                         suggestions.append(MergeSuggestion(
                             layer_indices=list(range(i, j + 1)),
                             reason=f"'{pat_a}' and '{pat_b}' can be combined in a single RUN instruction",
                             potential_saving=saving,
+                            involved_files=involved,
                         ))
                     break
 
@@ -177,14 +181,43 @@ def generate_slimming_report(
 
     total_cache_size = sum(c.size for c in cache_findings)
 
-    total_potential = duplicate_waste + total_cache_size
+    counted: Set[Tuple[int, str]] = set()
+    total_potential = 0
+
+    dedup_cache = 0
+    for cf in cache_findings:
+        key = (cf.layer_index, cf.path)
+        if key not in counted:
+            counted.add(key)
+            dedup_cache += cf.size
+    total_potential += dedup_cache
+
+    dedup_duplicate = 0
+    for path, occurrences in duplicates.items():
+        for i in range(1, len(occurrences)):
+            layer_idx, size, _ = occurrences[i]
+            key = (layer_idx, path)
+            if key not in counted:
+                counted.add(key)
+                dedup_duplicate += size
+    total_potential += dedup_duplicate
+
+    dedup_merge = 0
     for s in merge_suggestions:
-        total_potential += s.potential_saving
+        merge_saving = 0
+        for layer_idx, file_path, file_size in s.involved_files:
+            key = (layer_idx, file_path)
+            if key not in counted:
+                counted.add(key)
+                merge_saving += file_size
+        s.potential_saving = merge_saving
+        total_potential += merge_saving
+        dedup_merge += merge_saving
 
     return SlimmingReport(
         cache_findings=cache_findings,
         merge_suggestions=merge_suggestions,
-        duplicate_waste=duplicate_waste,
-        total_cache_size=total_cache_size,
+        duplicate_waste=dedup_duplicate,
+        total_cache_size=dedup_cache,
         total_potential_saving=total_potential,
     )
