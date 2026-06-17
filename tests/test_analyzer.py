@@ -12,6 +12,11 @@ from docker_layer_analyzer.analyzer import (
     calculate_size_distribution,
     find_cache_files,
     generate_slimming_report,
+    build_analysis_summary,
+    AnalysisSummary,
+    LayerCacheRanking,
+    DuplicatePathRanking,
+    LayerActivityRanking,
 )
 
 
@@ -409,6 +414,125 @@ class TestSlimmingReport(unittest.TestCase):
                 self.assertIsInstance(item[0], int)
                 self.assertIsInstance(item[1], str)
                 self.assertIsInstance(item[2], int)
+
+
+class TestAnalysisSummary(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.tar_path = os.path.join(self.tmpdir, "test-image.tar")
+        _build_test_image_tar(self.tar_path)
+        self.image = parse_image_tar(self.tar_path)
+        analyze_layer_diffs(self.image)
+        self.duplicates = find_duplicate_files(self.image)
+        self.waste = calculate_duplicate_waste(self.duplicates)
+        self.report = generate_slimming_report(self.image, self.duplicates, self.waste)
+        self.summary = build_analysis_summary(
+            self.image,
+            self.report.cache_findings,
+            self.duplicates,
+            self.report.merge_suggestions,
+        )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_summary_is_analysis_summary_type(self):
+        self.assertIsInstance(self.summary, AnalysisSummary)
+
+    def test_largest_layers_ranking(self):
+        self.assertGreater(len(self.summary.largest_layers), 0)
+        prev_size = float("inf")
+        for idx, lid, size, pct in self.summary.largest_layers:
+            self.assertLessEqual(size, prev_size)
+            prev_size = size
+            self.assertIsInstance(idx, int)
+            self.assertIsInstance(size, int)
+            self.assertIsInstance(pct, float)
+            self.assertGreater(pct, 0)
+
+    def test_largest_layers_sum_sanity(self):
+        total_pct = sum(x[3] for x in self.summary.largest_layers)
+        self.assertLessEqual(total_pct, 100.0)
+
+    def test_cache_ranking_by_layer_structure(self):
+        self.assertGreater(len(self.summary.cache_ranking_by_layer), 0)
+        for r in self.summary.cache_ranking_by_layer:
+            self.assertIsInstance(r, LayerCacheRanking)
+            self.assertGreaterEqual(r.cache_count, 1)
+            self.assertGreaterEqual(r.cache_size, 0)
+            self.assertIsInstance(r.layer_index, int)
+            self.assertIsInstance(r.top_categories, list)
+
+    def test_cache_ranking_by_layer_sorted(self):
+        prev_size = float("inf")
+        for r in self.summary.cache_ranking_by_layer:
+            self.assertLessEqual(r.cache_size, prev_size)
+            prev_size = r.cache_size
+
+    def test_cache_ranking_by_category(self):
+        self.assertGreater(len(self.summary.cache_ranking_by_category), 0)
+        for cat, count, size in self.summary.cache_ranking_by_category:
+            self.assertIsInstance(cat, str)
+            self.assertGreaterEqual(count, 1)
+            self.assertGreaterEqual(size, 0)
+
+    def test_cache_ranking_by_category_sorted(self):
+        prev_size = float("inf")
+        for _, _, size in self.summary.cache_ranking_by_category:
+            self.assertLessEqual(size, prev_size)
+            prev_size = size
+
+    def test_duplicate_path_ranking_structure(self):
+        self.assertGreater(len(self.summary.duplicate_path_ranking), 0)
+        for r in self.summary.duplicate_path_ranking:
+            self.assertIsInstance(r, DuplicatePathRanking)
+            self.assertGreaterEqual(r.occurrences, 2)
+            self.assertGreaterEqual(r.total_wasted_bytes, 0)
+            self.assertGreater(r.max_size, 0)
+            self.assertEqual(len(r.layers_involved), r.occurrences)
+
+    def test_duplicate_path_ranking_sorted(self):
+        prev_waste = float("inf")
+        for r in self.summary.duplicate_path_ranking:
+            self.assertLessEqual(r.total_wasted_bytes, prev_waste)
+            prev_waste = r.total_wasted_bytes
+
+    def test_layer_activity_ranking(self):
+        self.assertEqual(len(self.summary.layer_activity_ranking), len(self.image.layers))
+        for r in self.summary.layer_activity_ranking:
+            self.assertIsInstance(r, LayerActivityRanking)
+            self.assertIsInstance(r.total_changes, int)
+            self.assertEqual(
+                r.total_changes,
+                r.added_count + r.modified_count + r.deleted_count,
+            )
+
+    def test_mergeable_layer_groups(self):
+        self.assertGreater(len(self.summary.mergeable_layer_groups), 0)
+        for indices, reason, saving in self.summary.mergeable_layer_groups:
+            self.assertIsInstance(indices, list)
+            self.assertGreaterEqual(len(indices), 2)
+            self.assertIsInstance(reason, str)
+            self.assertIsInstance(saving, int)
+
+    def test_largest_layer_contains_layer1_or_layer2(self):
+        top_idx = self.summary.largest_layers[0][0]
+        self.assertIn(top_idx, [0, 1])
+
+    def test_cache_ranking_apt_cache_category_present(self):
+        cats = {cat for cat, _, _ in self.summary.cache_ranking_by_category}
+        apt_found = any("apt" in c.lower() for c in cats)
+        self.assertTrue(apt_found)
+
+    def test_duplicate_ranking_contains_config_yml(self):
+        paths = {r.path for r in self.summary.duplicate_path_ranking}
+        self.assertIn("etc/config.yml", paths)
+        self.assertIn("usr/bin/app", paths)
+
+    def test_activity_ranking_layer0_has_max_added(self):
+        top = self.summary.layer_activity_ranking[0]
+        self.assertGreater(top.added_bytes, 0)
 
 
 if __name__ == "__main__":

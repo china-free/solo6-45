@@ -1,5 +1,6 @@
 import os
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -220,4 +221,178 @@ def generate_slimming_report(
         duplicate_waste=dedup_duplicate,
         total_cache_size=dedup_cache,
         total_potential_saving=total_potential,
+    )
+
+
+@dataclass
+class LayerCacheRanking:
+    layer_index: int
+    layer_id: str
+    cache_count: int
+    cache_size: int
+    layer_size: int
+    cache_ratio: float
+    top_categories: List[Tuple[str, int]]
+
+
+@dataclass
+class DuplicatePathRanking:
+    path: str
+    occurrences: int
+    total_wasted_bytes: int
+    max_size: int
+    layers_involved: List[int]
+
+
+@dataclass
+class LayerActivityRanking:
+    layer_index: int
+    layer_id: str
+    total_changes: int
+    added_count: int
+    modified_count: int
+    deleted_count: int
+    added_bytes: int
+
+
+@dataclass
+class AnalysisSummary:
+    largest_layers: List[Tuple[int, str, int, float]]
+    cache_ranking_by_layer: List[LayerCacheRanking]
+    cache_ranking_by_category: List[Tuple[str, int, int]]
+    duplicate_path_ranking: List[DuplicatePathRanking]
+    layer_activity_ranking: List[LayerActivityRanking]
+    mergeable_layer_groups: List[Tuple[List[int], str, int]]
+
+
+def _build_largest_layers(image: ImageInfo) -> List[Tuple[int, str, int, float]]:
+    result = []
+    for i, layer in enumerate(image.layers):
+        ratio = layer.size / image.total_size * 100 if image.total_size > 0 else 0
+        result.append((i, layer.id, layer.size, ratio))
+    result.sort(key=lambda x: x[2], reverse=True)
+    return result[:5]
+
+
+def _build_cache_ranking_by_layer(
+    image: ImageInfo, cache_findings: List[CacheFinding]
+) -> List[LayerCacheRanking]:
+    by_layer: Dict[int, List[CacheFinding]] = defaultdict(list)
+    for cf in cache_findings:
+        by_layer[cf.layer_index].append(cf)
+
+    rankings = []
+    for idx, findings in by_layer.items():
+        layer = image.layers[idx]
+        total_size = sum(f.size for f in findings)
+        ratio = total_size / layer.size * 100 if layer.size > 0 else 0
+
+        cat_sizes: Dict[str, int] = defaultdict(int)
+        for f in findings:
+            cat_sizes[f.category] += f.size
+        top_cats = sorted(cat_sizes.items(), key=lambda x: x[1], reverse=True)[:3]
+
+        rankings.append(LayerCacheRanking(
+            layer_index=idx,
+            layer_id=layer.id,
+            cache_count=len(findings),
+            cache_size=total_size,
+            layer_size=layer.size,
+            cache_ratio=ratio,
+            top_categories=top_cats,
+        ))
+
+    rankings.sort(key=lambda r: r.cache_size, reverse=True)
+    return rankings
+
+
+def _build_cache_ranking_by_category(
+    cache_findings: List[CacheFinding],
+) -> List[Tuple[str, int, int]]:
+    by_cat: Dict[str, Tuple[int, int]] = defaultdict(lambda: (0, 0))
+    for cf in cache_findings:
+        count, size = by_cat[cf.category]
+        by_cat[cf.category] = (count + 1, size + cf.size)
+    result = [(cat, count, size) for cat, (count, size) in by_cat.items()]
+    result.sort(key=lambda x: x[2], reverse=True)
+    return result
+
+
+def _build_duplicate_path_ranking(
+    duplicates: Dict[str, List[Tuple[int, int, str]]],
+) -> List[DuplicatePathRanking]:
+    rankings = []
+    for path, occurrences in duplicates.items():
+        wasted = 0
+        sizes = []
+        layers = []
+        for i in range(len(occurrences)):
+            layer_idx, size, layer_id = occurrences[i]
+            sizes.append(size)
+            layers.append(layer_idx)
+            if i > 0:
+                wasted += size
+        rankings.append(DuplicatePathRanking(
+            path=path,
+            occurrences=len(occurrences),
+            total_wasted_bytes=wasted,
+            max_size=max(sizes),
+            layers_involved=layers,
+        ))
+    rankings.sort(key=lambda r: r.total_wasted_bytes, reverse=True)
+    return rankings
+
+
+def _build_layer_activity_ranking(
+    image: ImageInfo,
+) -> List[LayerActivityRanking]:
+    file_size_by_layer: Dict[int, Dict[str, int]] = {}
+    for idx, layer in enumerate(image.layers):
+        file_size_by_layer[idx] = {f.path: f.size for f in layer.files}
+
+    rankings = []
+    for i, layer in enumerate(image.layers):
+        total_changes = len(layer.added_files) + len(layer.modified_files) + len(layer.deleted_files)
+
+        added_bytes = 0
+        size_map = file_size_by_layer.get(i, {})
+        for p in layer.added_files:
+            added_bytes += size_map.get(p, 0)
+
+        rankings.append(LayerActivityRanking(
+            layer_index=i,
+            layer_id=layer.id,
+            total_changes=total_changes,
+            added_count=len(layer.added_files),
+            modified_count=len(layer.modified_files),
+            deleted_count=len(layer.deleted_files),
+            added_bytes=added_bytes,
+        ))
+    rankings.sort(key=lambda r: (r.added_bytes, r.total_changes), reverse=True)
+    return rankings
+
+
+def build_analysis_summary(
+    image: ImageInfo,
+    cache_findings: List[CacheFinding],
+    duplicates: Dict[str, List[Tuple[int, int, str]]],
+    merge_suggestions: List[MergeSuggestion],
+) -> AnalysisSummary:
+    largest = _build_largest_layers(image)
+    cache_by_layer = _build_cache_ranking_by_layer(image, cache_findings)
+    cache_by_cat = _build_cache_ranking_by_category(cache_findings)
+    dup_rank = _build_duplicate_path_ranking(duplicates)
+    activity = _build_layer_activity_ranking(image)
+    merge_groups = [
+        (s.layer_indices, s.reason, s.potential_saving)
+        for s in sorted(merge_suggestions, key=lambda x: x.potential_saving, reverse=True)
+    ]
+
+    return AnalysisSummary(
+        largest_layers=largest,
+        cache_ranking_by_layer=cache_by_layer,
+        cache_ranking_by_category=cache_by_cat,
+        duplicate_path_ranking=dup_rank,
+        layer_activity_ranking=activity,
+        mergeable_layer_groups=merge_groups,
     )

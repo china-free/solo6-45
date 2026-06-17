@@ -5,6 +5,17 @@ import tempfile
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from .parser import ImageInfo, LayerInfo, parse_image_tar, save_image_from_docker
 from .differ import analyze_layer_diffs, calculate_duplicate_waste, find_duplicate_files
 from .analyzer import (
@@ -14,6 +25,8 @@ from .analyzer import (
     SizeDistribution,
     CacheFinding,
     MergeSuggestion,
+    build_analysis_summary,
+    AnalysisSummary,
 )
 
 
@@ -192,6 +205,90 @@ def _print_slimming_report(report: SlimmingReport, image: ImageInfo) -> None:
         print(f"  Use multi-stage builds to prevent build artifacts from reaching final image.")
 
 
+def _print_summary(summary: AnalysisSummary, total_size: int, total_potential: int) -> None:
+    _print_header("Analysis Summary by Issue Type")
+
+    _print_subheader("🔹 Layer Size Hotspots (Top Layers)")
+    print(f"  {'Rank':<5} {'Layer':<22} {'Size':>12} {'%':>8}  {'Comment'}")
+    print(f"  {'─' * 5} {'─' * 22} {'─' * 12} {'─' * 8}  {'─' * 30}")
+    labels = ["🥇 1st largest", "🥈 2nd largest", "🥉 3rd largest", "4th", "5th"]
+    for rank, (idx, lid, size, pct) in enumerate(summary.largest_layers):
+        comment = f"Focus: {_format_size(size)} occupies {pct:.1f}% of total"
+        print(f"  {labels[rank]:<5} L{idx + 1}:{lid[:18]:<19} {_format_size(size):>12} {pct:>7.1f}%  {comment}")
+
+    if summary.cache_ranking_by_layer:
+        _print_subheader("🔹 Cache-Heavy Layers (Files most concentrated)")
+        print(f"  {'Layer':<18} {'Cache Files':<14} {'Cache Size':>12} {'% of Layer':>11}  {'Top Category'}")
+        print(f"  {'─' * 18} {'─' * 14} {'─' * 12} {'─' * 11}  {'─' * 30}")
+        for r in summary.cache_ranking_by_layer:
+            top_cat = r.top_categories[0][0] if r.top_categories else "-"
+            print(
+                f"  L{r.layer_index + 1}:{r.layer_id[:15]:<15} "
+                f"{r.cache_count:<14} {_format_size(r.cache_size):>12} {r.cache_ratio:>10.1f}%  "
+                f"{top_cat}"
+            )
+
+    if summary.cache_ranking_by_category:
+        _print_subheader("🔹 Cache Categories by Waste")
+        print(f"  {'Category':<32} {'Files':>7} {'Waste Size':>12}")
+        print(f"  {'─' * 32} {'─' * 7} {'─' * 12}")
+        for cat, count, size in summary.cache_ranking_by_category:
+            print(f"  {cat[:32]:<32} {count:>7} {_format_size(size):>12}")
+
+    if summary.duplicate_path_ranking:
+        _print_subheader("🔹 Most-Wasted Duplicate Paths")
+        print(f"  {'Path':<50} {'Occ':>4} {'Wasted':>12} {'Max Size':>12} {'Layers'}")
+        print(f"  {'─' * 50} {'─' * 4} {'─' * 12} {'─' * 12} {'─' * 12}")
+        for r in summary.duplicate_path_ranking[:10]:
+            layers_str = ",".join(f"L{l + 1}" for l in r.layers_involved)
+            path_display = r.path if len(r.path) <= 50 else "..." + r.path[-47:]
+            print(
+                f"  {path_display:<50} {r.occurrences:>4} "
+                f"{_format_size(r.total_wasted_bytes):>12} {_format_size(r.max_size):>12} {layers_str}"
+            )
+
+    if summary.layer_activity_ranking:
+        _print_subheader("🔹 Most Active Layers (by changes/bytes added)")
+        print(f"  {'Layer':<22} {'Changes':>8} {'+ Added':>8} {'~ Mod':>6} {'- Del':>6} {'Added Bytes':>12}")
+        print(f"  {'─' * 22} {'─' * 8} {'─' * 8} {'─' * 6} {'─' * 6} {'─' * 12}")
+        for r in summary.layer_activity_ranking:
+            print(
+                f"  L{r.layer_index + 1}:{r.layer_id[:19]:<19} "
+                f"{r.total_changes:>8} {r.added_count:>8} {r.modified_count:>6} "
+                f"{r.deleted_count:>6} {_format_size(r.added_bytes):>12}"
+            )
+
+    if summary.mergeable_layer_groups:
+        _print_subheader("🔹 Mergeable Layer Groups (High Impact First)")
+        print(f"  {'Layers':<18} {'Potential Saving':>16}  Reason")
+        print(f"  {'─' * 18} {'─' * 16}  {'─' * 40}")
+        for layer_idx, reason, saving in summary.mergeable_layer_groups[:5]:
+            layers_str = ",".join(f"L{i + 1}" for i in layer_idx)
+            print(f"  {layers_str:<18} {_format_size(saving):>16}  {reason}")
+
+    _print_subheader("📊 Overall Snapshot")
+    print(f"  Total image size:       {_format_size(total_size)}")
+    print(f"  Potential space save:   {_format_size(total_potential)}" +
+          (f" ({total_potential / total_size * 100:.1f}% of total)" if total_size > 0 else ""))
+    print()
+    print(f"  🎯 Action priorities:")
+    top_actions = []
+    if summary.cache_ranking_by_category:
+        top_cat = summary.cache_ranking_by_category[0]
+        top_actions.append(f"1. Clean {top_cat[0]} ({_format_size(top_cat[2])} savable)")
+    if summary.duplicate_path_ranking:
+        top_dup = summary.duplicate_path_ranking[0]
+        top_actions.append(f"2. Eliminate overwrite of '{top_dup.path[:40]}' ({_format_size(top_dup.total_wasted_bytes)})")
+    if summary.mergeable_layer_groups:
+        top_merge = summary.mergeable_layer_groups[0]
+        layers = ",".join(f"L{i + 1}" for i in top_merge[0])
+        top_actions.append(f"3. Merge {layers} → {_format_size(top_merge[2])} saved")
+    for act in top_actions:
+        print(f"     {act}")
+    if not top_actions:
+        print(f"     ✅ No significant issues detected.")
+
+
 def _is_tar_file(path: str) -> bool:
     return path.lower().endswith(".tar") or path.lower().endswith(".tar.gz")
 
@@ -274,6 +371,20 @@ Examples:
             print("Generating slimming suggestions...")
             report = generate_slimming_report(image, duplicates, waste)
             _print_slimming_report(report, image)
+
+        print("Building summary...")
+        if not args.no_slimming:
+            summary = build_analysis_summary(
+                image, report.cache_findings, duplicates, report.merge_suggestions
+            )
+            potential = report.total_potential_saving
+        else:
+            from .analyzer import find_cache_files, find_mergeable_layers
+            cf = find_cache_files(image) if not args.no_slimming else []
+            ms = find_mergeable_layers(image) if not args.no_slimming else []
+            summary = build_analysis_summary(image, cf, duplicates, ms)
+            potential = 0
+        _print_summary(summary, image.total_size, potential)
 
         print()
         print("=" * 80)
